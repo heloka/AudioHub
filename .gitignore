@@ -1,0 +1,24 @@
+# 本机配置（含内网 IP / 设备名，勿公开）
+devices.json
+
+__pycache__/
+*.pyc
+
+# 本地调试产物
+_*.py
+_*.png
+
+# 若做整合包发布，scrcpy 本体不进 git
+scrcpy-win64-*/
+
+/target/
+/audiohub.json
+/audiohub.exe
+
+# 原有本机脚本和历史用法
+/audio_hub.pyw
+/bind_static_ip.py
+/unbind_static_ip.py
+/绑定静态IP.bat
+/复原静态IP.bat
+/说明.md
