@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -21,6 +21,7 @@ const ADB_TIMEOUT: Duration = Duration::from_secs(7);
 pub struct Tools {
     adb: PathBuf,
     scrcpy: PathBuf,
+    adb_started: Arc<Mutex<Option<Instant>>>,
     fixed_port: Arc<AtomicBool>,
     usb_stop: Arc<AtomicBool>,
     usb_switches: Arc<std::sync::Mutex<std::collections::HashMap<String, Instant>>>,
@@ -98,6 +99,7 @@ impl Tools {
         };
         Self {
             fixed_port: Default::default(),
+            adb_started: Default::default(),
             usb_stop: Arc::new(AtomicBool::new(true)),
             usb_switches: Default::default(),
             adb: find(if cfg!(windows) { "adb.exe" } else { "adb" }),
@@ -297,6 +299,7 @@ impl Tools {
             return Err("请输入有效的配对地址和六位配对码".into());
         }
         let stop = AtomicBool::new(false);
+        self.start_adb(&stop)?;
         // Pairing services live only as long as the Android pairing dialog.
         // Query the current advertisements; the UI may still show an earlier scan.
         if let Ok(services) = self.discover_services(&stop) {
@@ -335,7 +338,66 @@ impl Tools {
     }
 
     fn adb(&self, args: &[&str], stop: &AtomicBool) -> Result<String, String> {
+        self.start_adb(stop)?;
         capture(command(&self.adb).args(args), None, ADB_TIMEOUT, stop)
+    }
+
+    fn start_adb(&self, stop: &AtomicBool) -> Result<(), String> {
+        let mut started = self.adb_started.lock().unwrap();
+        if started.is_some_and(|when| !cfg!(windows) || when.elapsed() < Duration::from_secs(2)) {
+            return Ok(());
+        }
+        self.boot_adb(stop)
+            .map_err(|reason| format!("启动 AudioHub 的 ADB 服务失败：{reason}"))?;
+        *started = Some(Instant::now());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn boot_adb(&self, stop: &AtomicBool) -> Result<(), String> {
+        let address: SocketAddr = format!("127.0.0.1:{PORT}").parse().unwrap();
+        let listening = || TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok();
+        if listening() {
+            return Ok(());
+        }
+        if stopped(stop) {
+            return Err("操作已取消".into());
+        }
+
+        // Run the daemon directly. The Windows ADB launcher can hang while
+        // waiting for its forked server to report readiness to a GUI process.
+        // Without -a, a port-only smart socket listens on the local machine.
+        let mut server = command(&self.adb)
+            .args(["-L", &format!("tcp:{PORT}"), "nodaemon", "server"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        let deadline = Instant::now() + ADB_TIMEOUT;
+        loop {
+            if listening() {
+                return Ok(());
+            }
+            if let Some(status) = server.try_wait().map_err(|error| error.to_string())? {
+                return Err(format!("ADB 服务已退出（{status}）"));
+            }
+            if Instant::now() >= deadline || !pause(POLL, stop) {
+                terminate(&mut server);
+                return Err("ADB 服务未能在本机 5038 端口启动".into());
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn boot_adb(&self, stop: &AtomicBool) -> Result<(), String> {
+        capture(
+            command(&self.adb).arg("start-server"),
+            None,
+            ADB_TIMEOUT,
+            stop,
+        )
+        .map(|_| ())
     }
 
     fn run(
@@ -355,6 +417,7 @@ impl Tools {
         };
         let mut backoff = Duration::from_secs(2);
         let mut last_switch = None::<Instant>;
+        let mut had_fixed_endpoint = is_fixed_endpoint(&device.addr);
         let mut saved_endpoint = (device.addr.clone(), device.identity.clone());
         while !stopped(stop) {
             let attempt = Instant::now();
@@ -362,6 +425,7 @@ impl Tools {
                 self.locate(&device, stop)
                     .and_then(|(mut addr, mut transport, identity)| {
                         if self.fixed_port.load(Ordering::Relaxed)
+                            && !had_fixed_endpoint
                             && let (Some(mut socket), Some(serial)) =
                                 (endpoint(&addr), identity.as_ref())
                             && !matches!(socket.port(), 5555 | 5556)
@@ -376,16 +440,18 @@ impl Tools {
                                 .adb(&["-s", &transport, "tcpip", "5556"], stop)
                                 .is_ok_and(|out| out.contains("restarting"))
                             {
-                                // The native transport has closed. Keep the candidate locally
-                                // until the hardware serial is verified over the new transport.
+                                // Keep the last verified address until the new port works.
+                                // The next attempt can rediscover the native connection if
+                                // adbd restarted without opening the fixed port.
+                                device.addr.clone_from(&addr);
                                 device.identity = Some(serial.clone());
-                                device.addr.clone_from(&fixed);
                                 pause(Duration::from_secs(1), stop);
                                 self.identify(&fixed, Some(serial), stop)?;
                                 addr.clone_from(&fixed);
                                 transport = fixed;
                             }
                         }
+                        had_fixed_endpoint |= is_fixed_endpoint(&addr);
                         if let Some(identity) = identity {
                             device.addr.clone_from(&addr);
                             device.identity = Some(identity.clone());
@@ -431,7 +497,7 @@ impl Tools {
         let addr = &device.addr;
         let current = self.identify(addr, device.identity.as_deref(), stop);
         let current_socket = endpoint(addr);
-        let legacy = current_socket.is_some_and(|socket| matches!(socket.port(), 5555 | 5556));
+        let legacy = is_fixed_endpoint(addr);
         if current.is_ok() && (!legacy || self.fixed_port.load(Ordering::Relaxed)) {
             return current.map(|serial| (addr.clone(), addr.clone(), serial));
         }
@@ -468,9 +534,9 @@ impl Tools {
         native_only: bool,
         stop: &AtomicBool,
     ) -> Option<(String, String)> {
-        let mut services = self.discover_services(stop).ok()?;
-        services.sort_by_key(|(_, tls)| !*tls);
+        let mut services = self.discover_services(stop).unwrap_or_default();
         let online = self.adb(&["devices"], stop).ok()?;
+        services.sort_by_key(|(_, tls)| !*tls);
         for (found, tls) in services {
             if stopped(stop) {
                 return None;
@@ -486,20 +552,30 @@ impl Tools {
             let transport = if alias_is_online {
                 alias
             } else {
-                let serial_hint = found.name.strip_prefix("adb-").is_some_and(|name| {
-                    name.strip_prefix(expected)
-                        .is_some_and(|suffix| suffix.starts_with('-'))
-                });
+                let serial_hint = advertised_serial_matches(&found.name, expected);
                 let same_host =
                     endpoint(&found.addr).is_some_and(|socket| socket.ip() == previous_ip);
                 let already_online = device_state(&online, &found.addr) == Some("device");
-                if !(already_online || (tls && (same_host || serial_hint))) {
+                if !(already_online || serial_hint || (tls && same_host)) {
                     continue;
                 }
                 found.addr.clone()
             };
             if self.identify(&transport, Some(expected), stop).is_ok() {
                 return Some((found.addr, transport));
+            }
+        }
+        // ADB can have an authorized TLS transport even when mDNS has no address
+        // for it yet. Recover playback while keeping the last verified address.
+        for line in online.lines() {
+            let mut fields = line.split_whitespace();
+            if let (Some(transport), Some("device")) = (fields.next(), fields.next())
+                && transport
+                    .strip_suffix("._adb-tls-connect._tcp")
+                    .is_some_and(|name| advertised_serial_matches(name, expected))
+                && self.identify(transport, Some(expected), stop).is_ok()
+            {
+                return Some((previous.to_owned(), transport.to_owned()));
             }
         }
         None
@@ -527,8 +603,22 @@ impl Tools {
                         "正在等待 {addr}。请检查平板已接入同一 Wi-Fi 并开启无线调试"
                     ));
                 }
-                self.adb(&["connect", addr], stop)?;
-                state = self.state(addr, stop)?;
+                let connection = self.adb(&["connect", addr], stop);
+                // ADB can report an offline transport while its authentication
+                // finishes. Give this attempt time before the next disconnect.
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    state = self.state(addr, stop)?;
+                    if matches!(state.as_deref(), Some("device" | "unauthorized"))
+                        || Instant::now() >= deadline
+                        || !pause(Duration::from_millis(300), stop)
+                    {
+                        break;
+                    }
+                }
+                if !matches!(state.as_deref(), Some("device" | "unauthorized")) {
+                    connection?;
+                }
             }
         }
         match state.as_deref() {
@@ -794,6 +884,16 @@ fn endpoint(addr: &str) -> Option<SocketAddr> {
     (socket.port() != 0).then_some(socket)
 }
 
+fn is_fixed_endpoint(addr: &str) -> bool {
+    endpoint(addr).is_some_and(|socket| matches!(socket.port(), 5555 | 5556))
+}
+
+fn advertised_serial_matches(name: &str, expected: &str) -> bool {
+    name.strip_prefix("adb-")
+        .and_then(|name| name.strip_prefix(expected))
+        .is_some_and(|suffix| suffix.starts_with('-'))
+}
+
 fn parse_mdns(output: &str) -> Vec<(Found, bool)> {
     let mut found: Vec<(Found, bool)> = Vec::new();
     for line in output.lines() {
@@ -871,7 +971,7 @@ fn scrcpy_error(line: &str) -> Option<&str> {
 fn command(path: &Path) -> Command {
     let mut cmd = Command::new(path);
     cmd.env("ANDROID_ADB_SERVER_PORT", PORT)
-        .env("ADB_SERVER_SOCKET", format!("tcp:localhost:{PORT}"))
+        .env_remove("ADB_SERVER_SOCKET")
         .env_remove("ANDROID_ADB_SERVER_ADDRESS");
     #[cfg(windows)]
     {
@@ -1255,6 +1355,7 @@ exec sleep 30
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
         let tools = Tools::discover(dir.path());
+        tools.set_fixed_port(true);
         assert_eq!(tools.scan().unwrap()[0].addr, "127.0.0.1:5556");
         tools.pair("192.0.2.7:12345", "123456").unwrap();
         let (events, output) = mpsc::channel();
@@ -1300,11 +1401,72 @@ exec sleep 30
                 "player {pid} survived session shutdown"
             );
         }
-        assert!(
-            !fs::read_to_string(commands)
-                .unwrap()
-                .lines()
-                .any(|line| line.starts_with("connect "))
+        let commands = fs::read_to_string(commands).unwrap();
+        assert!(!commands.lines().any(|line| line.starts_with("connect ")));
+        assert!(!commands.contains("tcpip 5556"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovers_authorized_tls_transport_without_mdns_address() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let adb = dir.path().join("adb");
+        fs::write(
+            &adb,
+            r#"#!/bin/sh
+case "$1" in
+    devices) printf 'adb-PADXYZ-discovered._adb-tls-connect._tcp device\n' ;;
+    -s) [ "$2" = adb-PADXYZ-discovered._adb-tls-connect._tcp ] && echo PADXYZ ;;
+    mdns) exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(adb, fs::Permissions::from_mode(0o700)).unwrap();
+        let tools = Tools::discover(dir.path());
+        let stop = AtomicBool::new(false);
+        let previous = "192.0.2.20:5556";
+        let ip = endpoint(previous).unwrap().ip();
+        assert_eq!(
+            tools.rediscover(previous, ip, "PADXYZ", false, &stop),
+            Some((
+                previous.into(),
+                "adb-PADXYZ-discovered._adb-tls-connect._tcp".into()
+            ))
+        );
+        assert_eq!(tools.rediscover(previous, ip, "PAD", false, &stop), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn starts_adb_once_before_concurrent_requests() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let adb = dir.path().join("adb");
+        fs::write(
+            &adb,
+            r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+[ "$ANDROID_ADB_SERVER_PORT" = 5038 ] && [ -z "$ADB_SERVER_SOCKET" ] || exit 1
+case "$1" in
+    start-server) echo start >> launches; sleep 0.2; touch ready ;;
+    devices|mdns) test -f ready ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(adb, fs::Permissions::from_mode(0o700)).unwrap();
+        let tools = Tools::discover(dir.path());
+        thread::scope(|scope| {
+            let scan = scope.spawn(|| tools.scan());
+            let devices = scope.spawn(|| tools.adb(&["devices"], &AtomicBool::new(false)));
+            assert!(scan.join().unwrap().is_ok());
+            assert!(devices.join().unwrap().is_ok());
+        });
+        assert_eq!(
+            fs::read_to_string(dir.path().join("launches")).unwrap(),
+            "start\n"
         );
     }
 }

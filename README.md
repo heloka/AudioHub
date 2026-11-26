@@ -6,7 +6,7 @@
 
 ## 下载和运行
 
-1. 在 [GitHub Releases](https://github.com/heloka/AudioHub/releases/latest) 下载 `AudioHub-v0.1.0-windows-x64.zip` 并解压。
+1. 在 [GitHub Releases](https://github.com/heloka/AudioHub/releases/latest) 下载最新的 `AudioHub-v*-windows-x64.zip` 并解压。
 2. 下载 [官方 scrcpy 3.1 Windows x64 压缩包](https://github.com/Genymobile/scrcpy/releases/tag/v3.1)，将解压后的 `scrcpy-win64-v3.1` 文件夹放到 `AudioHub` 文件夹旁边。保留 scrcpy 发行包中的所有文件。
 3. 双击 `AudioHub\audiohub.exe`。按下文配对第一台设备，随后在控制台点「开始共享」。
 
@@ -30,7 +30,7 @@
 
 首次成功连接后，AudioHub 会记下能读取到的设备序列号。平板重启后，「开始共享」会尝试恢复连接。平板若弹出授权对话框，请在设备上确认；若无线调试已关闭，请重新打开。局域网需要允许 mDNS 才能自动发现新地址。无法发现时可按无线调试主页提供的地址手动添加。首次迁移且旧地址已经失效的设备，也可这样重新选定。
 
-历史 `IP:5556` 在仍有效时可以继续使用。系统关闭全部无线调试入口时，需要在平板上操作。Android 11 的部分设备在启动采音时还需要解锁屏幕。
+历史 `IP:5556` 在仍有效时可以继续使用。如果固定端口失效，恢复共享时会尝试已授权的原生无线调试连接，并再次核对设备序列号。系统关闭全部无线调试入口时，需要在平板上操作。Android 11 的部分设备在启动采音时还需要解锁屏幕。
 
 ## 控制台与自动化
 
@@ -51,8 +51,8 @@
 
 从源码构建需要 Windows x64、Rust stable MSVC、Visual Studio C++ Build Tools 和包含 `fxc.exe` 的 Windows SDK。运行 `build.cmd` 会生成项目根目录的 `audiohub.exe`。在已配置同样工具链的开发者命令提示符中可运行 `cargo test --locked`。如果 SDK 编译器不在 PATH，可将 `GPUI_FXC_PATH` 设为 `fxc.exe` 的完整路径。
 
-## 首发验证
+## 实机验证
 
-已实测 Windows x64 下小米平板与 OPPO Pad mini 同时播放。其他设备的无线配对和采音行为会受到 Android 版本及厂商系统影响。
+已实测 Windows x64 下小米平板与 OPPO Pad mini 同时播放。开启「启动时恢复共享」后，也已验证重启电脑并打开 AudioHub 时，两台设备能自动恢复连接。其他设备的无线配对和采音行为会受到 Android 版本及厂商系统影响。
 
 [AudioHub 许可证](LICENSE) · [第三方组件](THIRD_PARTY_NOTICES.md) · [Android 无线调试说明](https://developer.android.com/tools/adb#wireless)
